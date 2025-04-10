@@ -1,0 +1,8 @@
+Hi Veerendra, I have made some progress, new goal is
+ 
+implement pydantic classes
+Validate the LLM output against pydantic classes
+Make the given csv into chunks
+we then give each chunk into the llm
+add up all the chunks to form final json
+right now, I'm able to give each chunk into the llm, but I'm getting errors validating output aganist pydantic class when given chunks to llms. So please continue the work from there.
