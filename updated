@@ -1,0 +1,381 @@
+import sys
+import os
+import csv
+import pandas as pd
+import json
+import io
+import logging
+import traceback
+import re
+import requests
+import numpy as np
+import uvicorn
+import base64
+import httpx
+from typing import Optional, List, Dict, Any
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Depends, Query
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel, ValidationError
+
+sys.path.append(os.getcwd())
+from src.backend.core import Core
+from src.backend.llm import llm
+from src.backend.data import FHIR_Resource_list, Layout_list, Github_Token
+from src.backend.prompts import system_prompt, User_prompt
+from src.backend.core import Core
+from src.backend.data import FHIR_Resource_list, Layout_list
+from src.backend.output_format import ExpectedOutputFormat
+from langchain.output_parsers import PydanticOutputParser
+from io import StringIO
+
+# Configure logging
+logging.basicConfig(
+    filename="api.log",
+    level=logging.ERROR,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
+
+# Create FastAPI app
+app = FastAPI(
+    title="CVS Health - CDR Test Case Generation API",
+    description="API for generating test cases for CDR validation",
+    version="1.0.0"
+)
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allows all origins
+    allow_credentials=True,
+    allow_methods=["*"],  # Allows all methods
+    allow_headers=["*"],  # Allows all headers
+)
+
+# Define request models
+class GenerateTestCasesRequest(BaseModel):
+    layout_type: str
+    fhir_resource: str
+    display_prompt: bool = False
+    changelog: str = ""
+
+class TestCaseResponse(BaseModel):
+    success: bool
+    message: str
+    response: Optional[str] = None
+    test_cases: Optional[List[Dict[str, Any]]] = None
+    missing_test_cases: Optional[List[Dict[str, Any]]] = None
+    breaking_test_cases: Optional[List[Dict[str, Any]]] = None
+    statistical_summary: Optional[Dict[str, Any]] = None
+
+# Validate the selected options
+def validate_options(layout_type: str, fhir_resource: str):
+    if layout_type not in Layout_list:
+        raise HTTPException(status_code=400, detail=f"Invalid layout type. Must be one of: {', '.join(Layout_list)}")
+   
+    if fhir_resource not in FHIR_Resource_list:
+        raise HTTPException(status_code=400, detail=f"Invalid FHIR resource. Must be one of: {', '.join(FHIR_Resource_list)}")
+   
+    return {"option1": layout_type, "option2": fhir_resource}
+
+# Function to process uploaded files
+async def process_files(
+    mapping_csv: UploadFile,
+    test_case_csv: Optional[UploadFile] = None,
+    sample_hl7: Optional[UploadFile] = None
+):
+    """
+    Processes the uploaded files.
+   
+    Args:
+        mapping_csv: The mapping CSV file (required).
+        test_case_csv: The test case CSV file (optional).
+        sample_hl7: The sample HL7 file (optional).
+       
+    Returns:
+        A dictionary containing the data from the files.
+    """
+    try:
+        # Process Mapping CSV (Required)
+        print("Processing mapping CSV file...")
+        try:
+            mapping_file = mapping_csv.file
+            CHUNK_SIZE = 20
+            mapping_dfs = []
+            header_row = None
+            for chunk in pd.read_csv(mapping_file, skiprows=1, chunksize=CHUNK_SIZE, header=1):
+                if header_row is None:
+                    header_row = chunk.columns.tolist()
+                chunk.columns = header_row
+                mapping_dfs.append(chunk)
+            print("Mapping CSV processed successfully.")
+        except Exception as e:
+            print("Error reading mapping CSV.")
+            raise HTTPException(status_code=400, detail=f"Error reading mapping CSV: {e}")
+       
+        # Process Test Case CSV (Optional)
+        test_case_df = None
+        if test_case_csv is not None:
+            content = await test_case_csv.read()
+            test_case_df = pd.read_csv(io.BytesIO(content))
+       
+        # Process HL7 File (Optional)
+        hl7_content = None
+        if sample_hl7 is not None:
+            content = await sample_hl7.read()
+            hl7_content = content.decode('utf-8')
+        print(mapping_dfs, test_case_df, hl7_content)
+        return {
+            "mapping_dfs": mapping_dfs,
+            "test_case_df": test_case_df,
+            "hl7_content": hl7_content
+        }
+       
+    except Exception as e:
+        print("I'm inside exception in process_files")
+        logging.error(f"Error processing files: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"Error processing files: {str(e)}")
+
+# Health check endpoint
+@app.get("/")
+async def root():
+    return {"status": "healthy", "message": "CDR Test Case Generation API is running"}
+
+@app.get('/health')
+def health():
+    return {'health': 'ok'}
+
+# Endpoint to get available options
+@app.get("/options")
+async def get_options():
+    return {
+        "layout_types": Layout_list,
+        "fhir_resources": FHIR_Resource_list
+    }
+
+def merge_llm_outputs(outputs: List[dict]) -> dict:
+    """
+    Merge multiple partial LLM outputs into one final dictionary conforming to ExpectedOutputFormat.
+    """
+    merged = {
+        "TestCases": [],
+        "MissingTestCases": [],
+        "BreakingTestCases": [],
+        "StatisticalSummary": {
+            "MappingRows": 0,
+            "UniqueAttributes": 0,  # Will be computed later
+            "NumberOfTestCasesCreated": 0,
+            "NumberOfTestCasesModified": 0,
+            "TestCaseTypeBreakdown": {"Functional": 0, "Regression": 0, "Edge": 0},
+            "SubtypeBreakdown": {"POSITIVE": 0, "NEGATIVE": 0},
+            "AttributeTestCaseDetails": []
+        }
+    }
+    
+    for out in outputs:
+        # Concatenate list fields
+        if "TestCases" in out:
+            merged["TestCases"].extend(out["TestCases"])
+        if "MissingTestCases" in out:
+            merged["MissingTestCases"].extend(out["MissingTestCases"])
+        if "BreakingTestCases" in out:
+            merged["BreakingTestCases"].extend(out["BreakingTestCases"])
+        
+        # Merge StatisticalSummary fields
+        if "StatisticalSummary" in out:
+            ss = out["StatisticalSummary"]
+            merged["StatisticalSummary"]["MappingRows"] += ss.get("MappingRows", 0)
+            merged["StatisticalSummary"]["NumberOfTestCasesCreated"] += ss.get("NumberOfTestCasesCreated", 0)
+            merged["StatisticalSummary"]["NumberOfTestCasesModified"] += ss.get("NumberOfTestCasesModified", 0)
+            # Merge the breakdowns by summing up their components
+            for key in merged["StatisticalSummary"]["TestCaseTypeBreakdown"]:
+                merged["StatisticalSummary"]["TestCaseTypeBreakdown"][key] += ss.get("TestCaseTypeBreakdown", {}).get(key, 0)
+            for key in merged["StatisticalSummary"]["SubtypeBreakdown"]:
+                merged["StatisticalSummary"]["SubtypeBreakdown"][key] += ss.get("SubtypeBreakdown", {}).get(key, 0)
+            # For attribute details, concatenate the lists
+            merged["StatisticalSummary"]["AttributeTestCaseDetails"].extend(ss.get("AttributeTestCaseDetails", []))
+    
+    # Compute UniqueAttributes based on the merged AttributeTestCaseDetails
+    unique_attributes = {detail["Attribute"] for detail in merged["StatisticalSummary"]["AttributeTestCaseDetails"] if "Attribute" in detail}
+    merged["StatisticalSummary"]["UniqueAttributes"] = len(unique_attributes)
+    
+    return merged
+
+# Main endpoint to generate test cases
+@app.post("/generate-test-cases", response_model=TestCaseResponse)
+async def generate_test_cases(
+    layout_type: str = Form(...),
+    fhir_resource: str = Form(...),
+    changelog: str = Form(""),
+    display_prompt: bool = Form(False),
+    mapping_csv: UploadFile = File(...),
+    test_case_csv: Optional[UploadFile] = File(None),
+    sample_hl7: Optional[UploadFile] = File(None)
+):
+    try:
+        # Validate options
+        print("Inside generate_test_cases endpoint")
+        selected_options = validate_options(layout_type, fhir_resource)
+        print(selected_options)
+       
+        # Process uploaded files
+        file_data = await process_files(mapping_csv, test_case_csv, sample_hl7)
+        print(file_data)
+        chunk_results = []  # To store each chunk's parsed output
+        
+        # Process each CSV chunk
+        for mapping_df in file_data['mapping_dfs']:
+            # Generate the prompts using the Core.dataprocessing function
+            formatted_sys_prompt, formatted_user_prompt = Core.dataprocessing(
+                mapping_df,
+                selected_options["option1"],
+                selected_options["option2"],
+                file_data["test_case_df"],
+                file_data["hl7_content"],
+                changelog
+            )
+            print(formatted_sys_prompt, formatted_user_prompt)
+            
+            # Prepare the concatenated prompt
+            concat_prompt = f"**System Prompt:** {formatted_sys_prompt}\n **User Prompt:** {formatted_user_prompt}"
+            
+            # Call the external API to generate test cases
+            api_url = "https://cdr-fhir-testcase-prep-api-dummy.hcb-dev.aig.aetna.com/GenerateTestCase_v2/"
+            input_params = {"concat_prompt": concat_prompt}
+            response = requests.post(api_url, json=input_params)
+            print("Response received from GenAI API:", response)
+        
+            if response.status_code != 200:
+                return TestCaseResponse(
+                    success=False,
+                    message=f"Error from GenAI API. Status code: {response.status_code}",
+                    response=response.text
+                )
+            
+            # Get and clean the raw response text
+            raw_response = response.text.strip()
+            response_data = json.loads(raw_response)
+            response_str = response_data.get("Response", "").strip()
+            
+            # Remove markdown formatting if present
+            if response_str.startswith("```json"):
+                response_str = response_str[len("```json"):].strip()
+            if response_str.endswith("```"):
+                response_str = response_str[:-len("```")].strip()
+            
+            # Parse the LLM output for this chunk into a dictionary
+            try:
+                chunk_output = json.loads(response_str)
+                chunk_results.append(chunk_output)
+            except Exception as e:
+                logging.error(f"Error parsing chunk output: {e}")
+                return TestCaseResponse(
+                    success=False,
+                    message=f"Error parsing chunk output: {str(e)}"
+                )
+        
+        # Merge all partial outputs into a single final dictionary
+        merged_output = merge_llm_outputs(chunk_results)
+        
+        # Final validation using the full Pydantic model
+        try:
+            final_validated_output = ExpectedOutputFormat.parse_obj(merged_output)
+        except ValidationError as e:
+            logging.error(f"Final validation error: {e}")
+            return TestCaseResponse(
+                success=False,
+                message=f"Final validation error: {str(e)}"
+            )
+        
+        # Write final validated output to a file
+        output_file_path = "generated_test_cases.json"
+        with open(output_file_path, "w", encoding="utf-8") as output_file:
+            output_file.write(final_validated_output.model_dump_json(by_alias=True, indent=4))
+        
+        print(f"Response written to {output_file_path}")
+        
+        # Map the parsed JSON values to the TestCaseResponse structure
+        test_cases = merged_output.get("TestCases")
+        missing_test_cases = merged_output.get("MissingTestCases")
+        breaking_test_cases = merged_output.get("BreakingTestCases")
+        statistical_summary = merged_output.get("StatisticalSummary")
+        
+        # Prepare the response using the merged results
+        response_data = TestCaseResponse(
+            success=True,
+            message="Test cases generated successfully",
+            test_cases=test_cases if test_cases is not None else None,
+            missing_test_cases=missing_test_cases if missing_test_cases is not None else None,
+            breaking_test_cases=breaking_test_cases if breaking_test_cases is not None else None,
+            statistical_summary=statistical_summary if statistical_summary is not None else None
+        )
+       
+        # Include the prompt in the response if requested
+        if display_prompt:
+            response_data.prompt = concat_prompt
+       
+        return response_data
+   
+    except Exception as e:
+        logging.error(f"Error generating test cases: {traceback.format_exc()}")
+        return TestCaseResponse(
+            success=False,
+            message=f"An error occurred: {str(e)}"
+        )
+
+@app.put("/upload-to-github")
+async def upload_to_github(file: UploadFile = File(...), github_url: str = Query(...)):
+    try:
+        # Read the file content
+        file_content = await file.read()
+        encoded_content = base64.b64encode(file_content).decode('utf-8')
+        # Prepare request payload for GitHub API
+        headers = {
+            "Authorization": f"token {Github_Token}",
+            "Accept": "application/vnd.github.v3+json"
+        }
+        payload = {
+            "message": f"Add {file.filename}",
+            "content": encoded_content,
+            "branch": "Dev-newapi"
+        }
+        url_parts = github_url.split('/')
+        repo_owner = url_parts[3]
+        repo_name = url_parts[4]
+        with requests.Session() as session:
+            session.headers.update(headers)
+        api_url = f"https://github.aetna.com/api/v3/repos/{repo_owner}/{repo_name}/contents/TestcasesOutput/{file.filename}"
+        response = session.put(api_url, json=payload, headers=headers)
+        if response.status_code == 201:
+            return {"status": "success", "message": f"File {file.filename} uploaded successfully"}
+        else:
+            raise HTTPException(status_code=response.status_code, detail=response.json())
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    
+@app.get("/download-binary-csv")
+async def download_csv(github_url: str = Query(...), filename: str = Query("downloaded.csv")):
+    try:
+        url_parts = github_url.split('/')
+        repo_owner = url_parts[3]
+        repo_name = url_parts[4]
+        file_path = '/'.join(url_parts[7:])
+        api_url = f"https://github.aetna.com/api/v3/repos/{repo_owner}/{repo_name}/contents/{file_path}"
+        headers = {
+            "Authorization": f"token {Github_Token}",
+            "Accept": "application/vnd.github.v3.raw"
+        }
+        response = requests.get(api_url, headers=headers)
+
+        if response.status_code == 200:
+            csv_content = response.text
+            csv_bytes = csv_content.encode('utf-8')
+            csv_base64 = base64.b64encode(csv_bytes).decode('utf-8')
+        
+            return {"csv_binary_data": csv_base64}
+        else:
+            print(f"Error: {response.status_code}, {response.text}")
+            raise HTTPException(status_code=response.status_code, detail=response.json())
+    except Exception as e:
+        print(f"Exception: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
